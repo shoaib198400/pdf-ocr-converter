@@ -1,6 +1,7 @@
 import io
 import os
 import platform
+import re
 import subprocess
 import sys
 import tempfile
@@ -18,7 +19,7 @@ if platform.system() == "Windows":
     TESSDATA_DIR  = rf"{TESSERACT_DIR}\tessdata"
     IS_CLOUD      = False
 else:
-    TESSERACT_DIR = None   # installed via apt on Linux, already in PATH
+    TESSERACT_DIR = None
     TESSDATA_DIR  = None
     IS_CLOUD      = True
 
@@ -40,12 +41,9 @@ st.markdown("""
     .stat-label  {font-size:0.75rem; color:#666; text-transform:uppercase;
                   letter-spacing:0.05em;}
     .stat-value  {font-size:1.4rem; font-weight:700; color:#1a1a2e;}
-    .file-row    {border:1px solid #e0e0e0; border-radius:8px; padding:12px;
-                  margin-bottom:8px; background:#fafafa;}
-    .success-tag {background:#d4edda; color:#155724; padding:2px 8px;
-                  border-radius:12px; font-size:0.8rem;}
     .error-tag   {background:#f8d7da; color:#721c24; padding:2px 8px;
                   border-radius:12px; font-size:0.8rem;}
+    .step-label  {font-size:0.82rem; color:#444; margin-top:2px;}
 </style>
 """, unsafe_allow_html=True)
 
@@ -53,7 +51,7 @@ st.markdown("""
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def get_ocr_env() -> dict:
-    env = {**os.environ}
+    env = {**os.environ, "PYTHONUNBUFFERED": "1"}
     if TESSERACT_DIR:
         env["PATH"] = TESSERACT_DIR + os.pathsep + env.get("PATH", "")
     if TESSDATA_DIR:
@@ -61,9 +59,25 @@ def get_ocr_env() -> dict:
     return env
 
 
-def run_ocr(input_path: str, output_path: str, language: str,
-            deskew: bool, clean: bool) -> tuple[bool, str]:
-    """Run ocrmypdf. Returns (success, message)."""
+def get_page_count(pdf_bytes: bytes) -> int:
+    try:
+        with pikepdf.open(io.BytesIO(pdf_bytes)) as pdf:
+            return len(pdf.pages)
+    except Exception:
+        return 0
+
+
+def run_ocr_with_progress(
+    input_path: str, output_path: str,
+    language: str, deskew: bool, clean: bool,
+    total_pages: int,
+    prog_bar, step_text,
+    prog_start: float = 0.02, prog_end: float = 0.72,
+) -> tuple[bool, str]:
+    """
+    Run ocrmypdf via Popen and stream stderr to update the progress bar
+    in real time. OCR phase covers prog_start → prog_end of the bar.
+    """
     cmd = [
         sys.executable, "-m", "ocrmypdf",
         "--output-type", "pdf",
@@ -78,23 +92,82 @@ def run_ocr(input_path: str, output_path: str, language: str,
         cmd.append("--clean")
     cmd += [input_path, output_path]
 
-    result = subprocess.run(cmd, capture_output=True, text=True, env=get_ocr_env())
-    ok  = result.returncode == 0
-    msg = (result.stderr or result.stdout or "").strip()
+    proc = subprocess.Popen(
+        cmd,
+        stderr=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        text=True,
+        env=get_ocr_env(),
+    )
+
+    pages_seen = 0
+    all_stderr = []
+    ocr_span   = prog_end - prog_start
+
+    for raw_line in iter(proc.stderr.readline, ""):
+        line = raw_line.strip()
+        if not line:
+            continue
+        all_stderr.append(line)
+
+        # "    33 page already has text!" or "    33 Weighted average..."
+        m = re.match(r"^\s*(\d+)\s+(?:page|Weighted)", line)
+        if m:
+            pages_seen = max(pages_seen, int(m.group(1)))
+            if total_pages:
+                pct = prog_start + (pages_seen / total_pages) * ocr_span * 0.80
+                prog_bar.progress(min(pct, prog_end * 0.82))
+            step_text.markdown(
+                f'<div class="step-label">🔍 OCR — page {pages_seen}'
+                f'{"/" + str(total_pages) if total_pages else ""}</div>',
+                unsafe_allow_html=True,
+            )
+        elif re.search(r"Parsing \d+ pages? with HocrParser", line):
+            prog_bar.progress(prog_start + ocr_span * 0.85)
+            step_text.markdown(
+                '<div class="step-label">📝 Building text layer...</div>',
+                unsafe_allow_html=True,
+            )
+        elif "Postprocessing" in line:
+            prog_bar.progress(prog_start + ocr_span * 0.95)
+            step_text.markdown(
+                '<div class="step-label">🔧 Postprocessing...</div>',
+                unsafe_allow_html=True,
+            )
+
+    proc.stderr.close()
+    proc.wait()
+
+    ok  = proc.returncode == 0
+    msg = "\n".join(all_stderr[-30:])   # keep last 30 lines for error display
     return ok, msg
 
 
-def compress_pdf_bytes(input_bytes: bytes, jpeg_quality: int,
-                       max_dim: int) -> tuple[bytes, int, int]:
+def compress_pdf_with_progress(
+    input_bytes: bytes, jpeg_quality: int, max_dim: int,
+    total_pages: int,
+    prog_bar, step_text,
+    prog_start: float = 0.72, prog_end: float = 0.97,
+) -> tuple[bytes, int, int]:
     """
-    Re-compress images in a PDF.
+    Re-compress PDF images with per-page progress updates.
     Returns (compressed_bytes, images_compressed, bytes_saved).
     """
-    pdf = pikepdf.open(io.BytesIO(input_bytes))
-    compressed = 0
+    pdf         = pikepdf.open(io.BytesIO(input_bytes))
+    compressed  = 0
     saved_total = 0
+    comp_span   = prog_end - prog_start
 
-    for page in pdf.pages:
+    for page_idx, page in enumerate(pdf.pages, 1):
+        # Update progress for each page
+        pct = prog_start + (page_idx / max(total_pages, 1)) * comp_span
+        prog_bar.progress(min(pct, prog_end))
+        step_text.markdown(
+            f'<div class="step-label">🗜️ Compressing — page {page_idx}'
+            f'{"/" + str(total_pages) if total_pages else ""}</div>',
+            unsafe_allow_html=True,
+        )
+
         for _, xobj in page.images.items():
             if xobj.get("/Subtype") != Name("/Image"):
                 continue
@@ -116,7 +189,7 @@ def compress_pdf_bytes(input_bytes: bytes, jpeg_quality: int,
                 continue
 
             orig_len = len(xobj.read_raw_bytes())
-            ow, oh = pil_img.size
+            ow, oh   = pil_img.size
             if max(ow, oh) > max_dim:
                 scale   = max_dim / max(ow, oh)
                 pil_img = pil_img.resize(
@@ -140,9 +213,13 @@ def compress_pdf_bytes(input_bytes: bytes, jpeg_quality: int,
             if pil_img.size != (ow, oh):
                 xobj["/Width"]  = pil_img.width
                 xobj["/Height"] = pil_img.height
-            compressed   += 1
-            saved_total  += orig_len - len(new_bytes)
+            compressed  += 1
+            saved_total += orig_len - len(new_bytes)
 
+    step_text.markdown(
+        '<div class="step-label">💾 Saving final PDF...</div>',
+        unsafe_allow_html=True,
+    )
     out_buf = io.BytesIO()
     pdf.save(out_buf, compress_streams=True,
              object_stream_mode=pikepdf.ObjectStreamMode.generate)
@@ -160,7 +237,7 @@ def human_size(n: int) -> str:
 
 # ── Session state init ────────────────────────────────────────────────────────
 if "results" not in st.session_state:
-    st.session_state.results = {}   # filename -> dict
+    st.session_state.results = {}
 
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
@@ -220,7 +297,6 @@ uploaded = st.file_uploader(
 
 if uploaded:
     new_names = {f.name for f in uploaded}
-    # Remove stale results for files no longer uploaded
     st.session_state.results = {
         k: v for k, v in st.session_state.results.items() if k in new_names
     }
@@ -235,66 +311,82 @@ if uploaded:
         st.rerun()
 
     if run_all:
-        progress_area = st.empty()
         for idx, f in enumerate(uploaded):
-            pct_start = idx / len(uploaded)
-            pct_end   = (idx + 1) / len(uploaded)
             name      = f.name
+            raw_bytes = f.read()
+            orig_size = len(raw_bytes)
 
-            progress_area.markdown(
-                f"**Processing {idx+1}/{len(uploaded)}: {name}**")
+            # ── Per-file progress container ───────────────────────────────
+            with st.container(border=True):
+                st.markdown(f"**{idx+1} / {len(uploaded)} — {name}**")
+                prog_bar  = st.progress(0.0)
+                step_text = st.empty()
 
-            raw_bytes   = f.read()
-            orig_size   = len(raw_bytes)
-            status_slot = st.empty()
+                step_text.markdown(
+                    '<div class="step-label">📂 Analysing file...</div>',
+                    unsafe_allow_html=True,
+                )
+                total_pages = get_page_count(raw_bytes)
+                prog_bar.progress(0.02)
 
-            with tempfile.TemporaryDirectory() as tmpdir:
-                src  = Path(tmpdir) / name
-                ocr  = Path(tmpdir) / f"ocr_{name}"
-                src.write_bytes(raw_bytes)
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    src = Path(tmpdir) / name
+                    ocr = Path(tmpdir) / f"ocr_{name}"
+                    src.write_bytes(raw_bytes)
 
-                # Step 1: OCR
-                status_slot.info(f"Running OCR on {name} ...")
-                ok, msg = run_ocr(str(src), str(ocr), language, deskew, clean)
-                if not ok:
-                    st.session_state.results[name] = {
-                        "status": "error",
-                        "error": msg,
-                        "orig_size": orig_size,
-                    }
-                    status_slot.error(f"OCR failed for {name}")
-                    continue
+                    # Step 1 — OCR (2% → 72%)
+                    step_text.markdown(
+                        f'<div class="step-label">🔍 Starting OCR'
+                        f'{f" ({total_pages} pages)" if total_pages else ""}...</div>',
+                        unsafe_allow_html=True,
+                    )
+                    ok, msg = run_ocr_with_progress(
+                        str(src), str(ocr), language, deskew, clean,
+                        total_pages, prog_bar, step_text,
+                    )
 
-                ocr_bytes  = ocr.read_bytes()
-                ocr_size   = len(ocr_bytes)
+                    if not ok:
+                        prog_bar.progress(1.0)
+                        step_text.error(f"OCR failed — {msg[-200:]}")
+                        st.session_state.results[name] = {
+                            "status": "error", "error": msg, "orig_size": orig_size,
+                        }
+                        continue
 
-                # Step 2: Compress
-                status_slot.info(f"Compressing {name} ...")
-                try:
-                    comp_bytes, n_imgs, saved = compress_pdf_bytes(
-                        ocr_bytes, jpeg_quality, max_dim)
-                    final_size = len(comp_bytes)
-                except Exception as e:
-                    comp_bytes = ocr_bytes
-                    final_size = ocr_size
-                    n_imgs, saved = 0, 0
+                    ocr_bytes = ocr.read_bytes()
 
-            stem     = Path(name).stem
-            out_name = f"{stem} (Searchable).pdf"
-            reduction = 100 * (1 - final_size / orig_size) if orig_size else 0
+                    # Step 2 — Compress (72% → 97%)
+                    try:
+                        comp_bytes, n_imgs, saved = compress_pdf_with_progress(
+                            ocr_bytes, jpeg_quality, max_dim,
+                            total_pages, prog_bar, step_text,
+                        )
+                        final_size = len(comp_bytes)
+                    except Exception:
+                        comp_bytes = ocr_bytes
+                        final_size = len(ocr_bytes)
+                        n_imgs = saved = 0
 
-            st.session_state.results[name] = {
-                "status":      "done",
-                "out_name":    out_name,
-                "orig_size":   orig_size,
-                "final_size":  final_size,
-                "reduction":   reduction,
-                "n_imgs":      n_imgs,
-                "data":        comp_bytes,
-            }
-            status_slot.empty()
+                # Step 3 — Done (100%)
+                prog_bar.progress(1.0)
+                reduction = 100 * (1 - final_size / orig_size) if orig_size else 0
+                step_text.success(
+                    f"Done!  {human_size(orig_size)} → {human_size(final_size)}"
+                    f"  ({reduction:.0f}% smaller)"
+                )
 
-        progress_area.empty()
+                stem     = Path(name).stem
+                out_name = f"{stem} (Searchable).pdf"
+                st.session_state.results[name] = {
+                    "status":     "done",
+                    "out_name":   out_name,
+                    "orig_size":  orig_size,
+                    "final_size": final_size,
+                    "reduction":  reduction,
+                    "n_imgs":     n_imgs,
+                    "data":       comp_bytes,
+                }
+
         st.rerun()
 
 
@@ -307,7 +399,6 @@ if results:
     st.markdown("---")
     st.markdown("### Results")
 
-    # Summary stats
     if done:
         total_in   = sum(r["orig_size"]  for r in done)
         total_out  = sum(r["final_size"] for r in done)
@@ -315,7 +406,7 @@ if results:
 
         c1, c2, c3, c4 = st.columns(4)
         for col, label, val in [
-            (c1, "Files Converted",  f"{len(done)}"),
+            (c1, "Files Converted",   f"{len(done)}"),
             (c2, "Total Input Size",  human_size(total_in)),
             (c3, "Total Output Size", human_size(total_out)),
             (c4, "Avg Size Reduction", f"{avg_reduce:.0f}%"),
@@ -324,11 +415,11 @@ if results:
                 f'<div class="stat-box">'
                 f'<div class="stat-label">{label}</div>'
                 f'<div class="stat-value">{val}</div></div>',
-                unsafe_allow_html=True)
+                unsafe_allow_html=True,
+            )
 
         st.markdown("")
 
-        # Download all ZIP
         if len(done) > 1:
             zip_buf = io.BytesIO()
             with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -343,7 +434,6 @@ if results:
             )
             st.markdown("")
 
-    # Per-file rows
     for fname, r in results.items():
         with st.container():
             if r["status"] == "done":
@@ -365,10 +455,10 @@ if results:
                 c2.markdown(
                     f'<span class="error-tag">Failed</span> '
                     f'<small>{r.get("error","")[:120]}</small>',
-                    unsafe_allow_html=True)
+                    unsafe_allow_html=True,
+                )
             st.divider()
 
-    # Errors summary
     if errors:
         with st.expander(f"{len(errors)} file(s) failed"):
             for r in errors:
