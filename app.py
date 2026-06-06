@@ -196,10 +196,18 @@ with st.sidebar:
 
 
 # ── Header ────────────────────────────────────────────────────────────────────
-st.markdown('<div class="main-header">📄 PDF OCR Converter</div>',
-            unsafe_allow_html=True)
-st.markdown('<div class="sub-header">Convert scanned PDFs into fully searchable documents</div>',
-            unsafe_allow_html=True)
+logo_path = Path(__file__).parent / "HP and DH.jpg"
+col_logo, col_title = st.columns([3, 7])
+with col_logo:
+    if logo_path.exists():
+        st.image(str(logo_path), width=300)
+with col_title:
+    st.markdown('<div style="height:18px"></div>', unsafe_allow_html=True)
+    st.markdown('<div class="main-header">PDF OCR Converter</div>',
+                unsafe_allow_html=True)
+    st.markdown('<div class="sub-header">Convert scanned PDFs into fully searchable documents</div>',
+                unsafe_allow_html=True)
+st.markdown("---")
 
 
 # ── Upload ────────────────────────────────────────────────────────────────────
