@@ -1,0 +1,15 @@
+# PDF files
+*.pdf
+
+# Local-only scripts
+compress_pdf.py
+Run App.bat
+
+# Claude internal
+.claude/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
