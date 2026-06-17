@@ -88,7 +88,8 @@ def run_ocr_with_progress(
         "--force-ocr",
         "-O", "0",
         "-l", language,
-        "--jobs", "1",          # 1 job = stable on cloud, less memory
+        "--jobs", "1",                       # 1 job = stable on cloud, less memory
+        "--invalidate-digital-signatures",   # allow OCR on digitally-signed PDFs
     ]
     if deskew:
         cmd.append("--deskew")
