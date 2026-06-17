@@ -1,10 +1,12 @@
 import io
 import os
 import platform
+import queue as queue_module
 import re
 import subprocess
 import sys
 import tempfile
+import threading
 import zipfile
 from pathlib import Path
 
@@ -75,8 +77,10 @@ def run_ocr_with_progress(
     prog_start: float = 0.02, prog_end: float = 0.72,
 ) -> tuple[bool, str]:
     """
-    Run ocrmypdf via Popen and stream stderr to update the progress bar
-    in real time. OCR phase covers prog_start → prog_end of the bar.
+    Run ocrmypdf and stream progress in real time.
+    Stderr is drained by a background thread into a queue so readline()
+    can never deadlock the main thread, and a per-line timeout kills the
+    process if it hangs (fixes Streamlit Cloud crashes).
     """
     cmd = [
         sys.executable, "-m", "ocrmypdf",
@@ -84,7 +88,7 @@ def run_ocr_with_progress(
         "--force-ocr",
         "-O", "0",
         "-l", language,
-        "--jobs", "2",
+        "--jobs", "1",          # 1 job = stable on cloud, less memory
     ]
     if deskew:
         cmd.append("--deskew")
@@ -97,20 +101,43 @@ def run_ocr_with_progress(
         stderr=subprocess.PIPE,
         stdout=subprocess.DEVNULL,
         text=True,
+        bufsize=1,              # line-buffered
         env=get_ocr_env(),
     )
+
+    # Drain stderr in a background thread → queue (prevents deadlock)
+    stderr_q = queue_module.Queue()
+
+    def _drain():
+        try:
+            for line in iter(proc.stderr.readline, ""):
+                stderr_q.put(line)
+        finally:
+            proc.stderr.close()
+            stderr_q.put(None)   # sentinel: stderr closed
+
+    threading.Thread(target=_drain, daemon=True).start()
 
     pages_seen = 0
     all_stderr = []
     ocr_span   = prog_end - prog_start
+    LINE_TIMEOUT = 300          # 5 min max silence before we give up
 
-    for raw_line in iter(proc.stderr.readline, ""):
+    while True:
+        try:
+            raw_line = stderr_q.get(timeout=LINE_TIMEOUT)
+        except queue_module.Empty:
+            proc.kill()
+            return False, "OCR timed out (no output for 5 minutes)."
+
+        if raw_line is None:    # sentinel — process finished writing
+            break
+
         line = raw_line.strip()
         if not line:
             continue
         all_stderr.append(line)
 
-        # "    33 page already has text!" or "    33 Weighted average..."
         m = re.match(r"^\s*(\d+)\s+(?:page|Weighted)", line)
         if m:
             pages_seen = max(pages_seen, int(m.group(1)))
@@ -135,11 +162,14 @@ def run_ocr_with_progress(
                 unsafe_allow_html=True,
             )
 
-    proc.stderr.close()
-    proc.wait()
+    try:
+        proc.wait(timeout=60)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
 
     ok  = proc.returncode == 0
-    msg = "\n".join(all_stderr[-30:])   # keep last 30 lines for error display
+    msg = "\n".join(all_stderr[-30:])
     return ok, msg
 
 
@@ -316,76 +346,86 @@ if uploaded:
             raw_bytes = f.read()
             orig_size = len(raw_bytes)
 
-            # ── Per-file progress container ───────────────────────────────
             with st.container(border=True):
                 st.markdown(f"**{idx+1} / {len(uploaded)} — {name}**")
                 prog_bar  = st.progress(0.0)
                 step_text = st.empty()
 
-                step_text.markdown(
-                    '<div class="step-label">📂 Analysing file...</div>',
-                    unsafe_allow_html=True,
-                )
-                total_pages = get_page_count(raw_bytes)
-                prog_bar.progress(0.02)
-
-                with tempfile.TemporaryDirectory() as tmpdir:
-                    src = Path(tmpdir) / name
-                    ocr = Path(tmpdir) / f"ocr_{name}"
-                    src.write_bytes(raw_bytes)
-
-                    # Step 1 — OCR (2% → 72%)
+                try:
                     step_text.markdown(
-                        f'<div class="step-label">🔍 Starting OCR'
-                        f'{f" ({total_pages} pages)" if total_pages else ""}...</div>',
+                        '<div class="step-label">📂 Analysing file...</div>',
                         unsafe_allow_html=True,
                     )
-                    ok, msg = run_ocr_with_progress(
-                        str(src), str(ocr), language, deskew, clean,
-                        total_pages, prog_bar, step_text,
-                    )
+                    total_pages = get_page_count(raw_bytes)
+                    prog_bar.progress(0.02)
 
-                    if not ok:
-                        prog_bar.progress(1.0)
-                        step_text.error(f"OCR failed — {msg[-200:]}")
-                        st.session_state.results[name] = {
-                            "status": "error", "error": msg, "orig_size": orig_size,
-                        }
-                        continue
+                    with tempfile.TemporaryDirectory() as tmpdir:
+                        src = Path(tmpdir) / name
+                        ocr = Path(tmpdir) / f"ocr_{name}"
+                        src.write_bytes(raw_bytes)
 
-                    ocr_bytes = ocr.read_bytes()
+                        # Step 1 — OCR (2% → 72%)
+                        pages_label = f" ({total_pages} pages)" if total_pages else ""
+                        step_text.markdown(
+                            f'<div class="step-label">🔍 Starting OCR{pages_label}...</div>',
+                            unsafe_allow_html=True,
+                        )
+                        ok, msg = run_ocr_with_progress(
+                            str(src), str(ocr), language, deskew, clean,
+                            total_pages, prog_bar, step_text,
+                        )
 
-                    # Step 2 — Compress (72% → 97%)
+                        if not ok:
+                            prog_bar.progress(1.0)
+                            step_text.error(f"OCR failed — {msg[-200:]}")
+                            st.session_state.results[name] = {
+                                "status": "error", "error": msg, "orig_size": orig_size,
+                            }
+                            continue
+
+                        ocr_bytes = ocr.read_bytes()
+
+                    # Step 2 — Compress (72% → 97%)  [outside tmpdir: frees disk space]
                     try:
                         comp_bytes, n_imgs, saved = compress_pdf_with_progress(
                             ocr_bytes, jpeg_quality, max_dim,
                             total_pages, prog_bar, step_text,
                         )
                         final_size = len(comp_bytes)
-                    except Exception:
+                    except Exception as e:
                         comp_bytes = ocr_bytes
                         final_size = len(ocr_bytes)
                         n_imgs = saved = 0
 
-                # Step 3 — Done (100%)
-                prog_bar.progress(1.0)
-                reduction = 100 * (1 - final_size / orig_size) if orig_size else 0
-                step_text.success(
-                    f"Done!  {human_size(orig_size)} → {human_size(final_size)}"
-                    f"  ({reduction:.0f}% smaller)"
-                )
+                    # Free the intermediate OCR buffer immediately
+                    del ocr_bytes
 
-                stem     = Path(name).stem
-                out_name = f"{stem} (Searchable).pdf"
-                st.session_state.results[name] = {
-                    "status":     "done",
-                    "out_name":   out_name,
-                    "orig_size":  orig_size,
-                    "final_size": final_size,
-                    "reduction":  reduction,
-                    "n_imgs":     n_imgs,
-                    "data":       comp_bytes,
-                }
+                    # Step 3 — Done
+                    prog_bar.progress(1.0)
+                    reduction = 100 * (1 - final_size / orig_size) if orig_size else 0
+                    step_text.success(
+                        f"Done!  {human_size(orig_size)} → {human_size(final_size)}"
+                        f"  ({reduction:.0f}% smaller)"
+                    )
+
+                    stem     = Path(name).stem
+                    out_name = f"{stem} (Searchable).pdf"
+                    st.session_state.results[name] = {
+                        "status":     "done",
+                        "out_name":   out_name,
+                        "orig_size":  orig_size,
+                        "final_size": final_size,
+                        "reduction":  reduction,
+                        "n_imgs":     n_imgs,
+                        "data":       comp_bytes,
+                    }
+
+                except Exception as exc:
+                    prog_bar.progress(1.0)
+                    step_text.error(f"Unexpected error: {exc}")
+                    st.session_state.results[name] = {
+                        "status": "error", "error": str(exc), "orig_size": orig_size,
+                    }
 
         st.rerun()
 
