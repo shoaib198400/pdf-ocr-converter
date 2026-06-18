@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pikepdf
 from pikepdf import Name, PdfImage
-from PIL import Image
+from PIL import Image, ImageEnhance, ImageFilter
 import streamlit as st
 
 # ── Tesseract paths (Windows local vs Linux cloud) ───────────────────────────
@@ -74,6 +74,7 @@ def run_ocr_with_progress(
     language: str, deskew: bool, clean: bool,
     total_pages: int,
     prog_bar, step_text,
+    ocr_dpi: int = 300,
     prog_start: float = 0.02, prog_end: float = 0.72,
 ) -> tuple[bool, str]:
     """
@@ -90,6 +91,7 @@ def run_ocr_with_progress(
         "-l", language,
         "--jobs", "1",                       # 1 job = stable on cloud, less memory
         "--invalidate-digital-signatures",   # allow OCR on digitally-signed PDFs
+        "--image-dpi", str(ocr_dpi),         # minimum DPI floor for rasterisation
     ]
     if deskew:
         cmd.append("--deskew")
@@ -178,6 +180,7 @@ def compress_pdf_with_progress(
     input_bytes: bytes, jpeg_quality: int, max_dim: int,
     total_pages: int,
     prog_bar, step_text,
+    enhance: bool = False,
     prog_start: float = 0.72, prog_end: float = 0.97,
 ) -> tuple[bytes, int, int]:
     """
@@ -234,6 +237,12 @@ def compress_pdf_with_progress(
                 except Exception:
                     continue
 
+            # Optional image enhancement for better readability
+            if enhance:
+                pil_img = pil_img.filter(ImageFilter.SHARPEN)
+                pil_img = ImageEnhance.Contrast(pil_img).enhance(1.25)
+                pil_img = ImageEnhance.Sharpness(pil_img).enhance(1.5)
+
             buf = io.BytesIO()
             pil_img.save(buf, format="JPEG", quality=jpeg_quality, optimize=True)
             new_bytes = buf.getvalue()
@@ -271,29 +280,77 @@ if "results" not in st.session_state:
     st.session_state.results = {}
 
 
+# ── Quality presets ───────────────────────────────────────────────────────────
+PRESETS = {
+    "Small File":   dict(jpeg_quality=72,  max_dim=1500, ocr_dpi=200, enhance=False),
+    "Balanced":     dict(jpeg_quality=85,  max_dim=2500, ocr_dpi=300, enhance=False),
+    "High Quality": dict(jpeg_quality=92,  max_dim=3500, ocr_dpi=400, enhance=True),
+    "Best Quality": dict(jpeg_quality=97,  max_dim=5000, ocr_dpi=400, enhance=True),
+    "Custom":       None,
+}
+
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("## ⚙️ Settings")
+
+    preset_name = st.selectbox(
+        "Quality Preset",
+        list(PRESETS.keys()),
+        index=2,                  # default: High Quality
+        help="Controls OCR DPI, JPEG quality and image enhancement",
+    )
+    preset = PRESETS[preset_name]
+
+    st.markdown("---")
+    st.markdown("**Output Quality**")
+
+    if preset:
+        # Show preset values as read-only info — sliders locked to preset
+        st.info(
+            f"OCR DPI: **{preset['ocr_dpi']}**  \n"
+            f"JPEG Quality: **{preset['jpeg_quality']}**  \n"
+            f"Max dimension: **{preset['max_dim']} px**  \n"
+            f"Image enhance: **{'On' if preset['enhance'] else 'Off'}**"
+        )
+        jpeg_quality = preset["jpeg_quality"]
+        max_dim      = preset["max_dim"]
+        ocr_dpi      = preset["ocr_dpi"]
+        enhance      = preset["enhance"]
+    else:
+        jpeg_quality = st.slider(
+            "JPEG Quality", 60, 97, 92,
+            help="Higher = better quality, larger file size",
+        )
+        max_dim = st.select_slider(
+            "Max image dimension (px)",
+            options=[1000, 1500, 2000, 2500, 3000, 3500, 4000, 5000],
+            value=3500,
+            help="Images larger than this are downsampled",
+        )
+        ocr_dpi = st.select_slider(
+            "OCR rasterisation DPI",
+            options=[150, 200, 300, 400],
+            value=300,
+            help="Higher DPI = sharper text layer, slower processing",
+        )
+        enhance = st.toggle(
+            "Enhance image quality",
+            value=True,
+            help="Apply sharpening and contrast boost to each page image",
+        )
+
+    st.markdown("---")
+    st.markdown("**OCR Options**")
 
     language = st.selectbox(
         "OCR Language",
         ["eng", "eng+osd"],
         help="Language pack for Tesseract",
     )
-    jpeg_quality = st.slider(
-        "Output JPEG Quality", 60, 95, 82,
-        help="Higher = better quality, larger file size",
-    )
-    max_dim = st.select_slider(
-        "Max image dimension (px)",
-        options=[1000, 1500, 2000, 2500, 3000, 4000],
-        value=2000,
-        help="Images larger than this are downsampled",
-    )
     deskew = st.toggle("Auto-deskew pages", value=False,
                        help="Straighten slightly tilted scans (slower)")
     clean  = st.toggle("Clean pages before OCR", value=False,
-                       help="Remove noise before OCR (slower)")
+                       help="Remove background noise before OCR (slower)")
 
     st.markdown("---")
     st.markdown("**Tesseract v5** · OCRmyPDF · pikepdf")
@@ -374,6 +431,7 @@ if uploaded:
                         ok, msg = run_ocr_with_progress(
                             str(src), str(ocr), language, deskew, clean,
                             total_pages, prog_bar, step_text,
+                            ocr_dpi=ocr_dpi,
                         )
 
                         if not ok:
@@ -391,6 +449,7 @@ if uploaded:
                         comp_bytes, n_imgs, saved = compress_pdf_with_progress(
                             ocr_bytes, jpeg_quality, max_dim,
                             total_pages, prog_bar, step_text,
+                            enhance=enhance,
                         )
                         final_size = len(comp_bytes)
                     except Exception as e:
