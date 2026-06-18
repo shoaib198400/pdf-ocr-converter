@@ -69,35 +69,75 @@ def get_page_count(pdf_bytes: bytes) -> int:
         return 0
 
 
+def detect_ocr_mode(pdf_bytes: bytes) -> str:
+    """
+    Return 'force' or 'preserve'.
+
+    Classic scanned PDFs have 1 large image per page → use --force-ocr.
+    Digitally-generated PDFs slice content into many small images per page
+    (e.g. table rows, headers) → rasterising destroys quality, so we use
+    --skip-text which runs Tesseract on the existing image structure and
+    leaves all original images untouched.
+    """
+    try:
+        with pikepdf.open(io.BytesIO(pdf_bytes)) as pdf:
+            sample_pages = list(pdf.pages[:5])
+            counts = [len(list(p.images)) for p in sample_pages]
+            avg = sum(counts) / max(len(counts), 1)
+        return "preserve" if avg > 5 else "force"
+    except Exception:
+        return "force"
+
+
 def run_ocr_with_progress(
     input_path: str, output_path: str,
     language: str, deskew: bool, clean: bool,
     total_pages: int,
     prog_bar, step_text,
     ocr_dpi: int = 300,
+    ocr_mode: str = "force",
     prog_start: float = 0.02, prog_end: float = 0.72,
 ) -> tuple[bool, str]:
     """
     Run ocrmypdf and stream progress in real time.
+
+    ocr_mode='force'    → --force-ocr: rasterises every page (classic scans).
+    ocr_mode='preserve' → --skip-text: Tesseract runs on existing images without
+                          rasterising, preserving all original image quality
+                          (multi-image / digitally-generated PDFs).
+
     Stderr is drained by a background thread into a queue so readline()
     can never deadlock the main thread, and a per-line timeout kills the
     process if it hangs (fixes Streamlit Cloud crashes).
     """
+    if ocr_mode == "preserve":
+        ocr_flag = "--skip-text"
+        mode_label = "quality-preserving"
+    else:
+        ocr_flag = "--force-ocr"
+        mode_label = "full-rasterise"
+
     cmd = [
         sys.executable, "-m", "ocrmypdf",
         "--output-type", "pdf",
-        "--force-ocr",
+        ocr_flag,
         "-O", "0",
         "-l", language,
-        "--jobs", "1",                       # 1 job = stable on cloud, less memory
-        "--invalidate-digital-signatures",   # allow OCR on digitally-signed PDFs
-        "--image-dpi", str(ocr_dpi),         # minimum DPI floor for rasterisation
+        "--jobs", "1",
+        "--invalidate-digital-signatures",
+        "--tagged-pdf-mode", "ignore",
+        "--image-dpi", str(ocr_dpi),
     ]
     if deskew:
         cmd.append("--deskew")
     if clean:
         cmd.append("--clean")
     cmd += [input_path, output_path]
+
+    step_text.markdown(
+        f'<div class="step-label">🔍 Starting OCR ({mode_label})...</div>',
+        unsafe_allow_html=True,
+    )
 
     proc = subprocess.Popen(
         cmd,
@@ -210,11 +250,17 @@ def compress_pdf_with_progress(
             if w * h < 10_000:
                 continue
             filters = xobj.get("/Filter")
+            flist = []
             if filters is not None:
                 flist = ([str(f) for f in filters]
                          if isinstance(filters, pikepdf.Array)
                          else [str(filters)])
-                if any(f in {"/JBIG2Decode", "/CCITTFaxDecode", "/JPXDecode"}
+                # Skip unsupported encodings.
+                # Also skip DCTDecode (already JPEG): re-encoding JPEG→JPEG
+                # introduces generation loss without meaningful space savings.
+                # Only compress uncompressed or FlateDecode images.
+                if any(f in {"/JBIG2Decode", "/CCITTFaxDecode",
+                             "/JPXDecode", "/DCTDecode"}
                        for f in flist):
                     continue
             try:
@@ -415,6 +461,7 @@ if uploaded:
                         unsafe_allow_html=True,
                     )
                     total_pages = get_page_count(raw_bytes)
+                    ocr_mode    = detect_ocr_mode(raw_bytes)
                     prog_bar.progress(0.02)
 
                     with tempfile.TemporaryDirectory() as tmpdir:
@@ -423,15 +470,11 @@ if uploaded:
                         src.write_bytes(raw_bytes)
 
                         # Step 1 — OCR (2% → 72%)
-                        pages_label = f" ({total_pages} pages)" if total_pages else ""
-                        step_text.markdown(
-                            f'<div class="step-label">🔍 Starting OCR{pages_label}...</div>',
-                            unsafe_allow_html=True,
-                        )
                         ok, msg = run_ocr_with_progress(
                             str(src), str(ocr), language, deskew, clean,
                             total_pages, prog_bar, step_text,
                             ocr_dpi=ocr_dpi,
+                            ocr_mode=ocr_mode,
                         )
 
                         if not ok:
